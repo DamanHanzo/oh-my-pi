@@ -69,6 +69,7 @@
 
 ### Changed
 
+- Switched edit tool execution to the vendored native `libedit` backend while preserving the existing replace, patch, and hashline tool contract
 - Changed `isAutoresearchShCommand()` to use proper command-line argument parsing instead of regex, improving accuracy for complex shell invocations
 - Changed autoresearch initialization prompt to display collected tradeoff metrics in the setup summary
 - Changed `command-initialize.md` template to include guidance on preflight requirements, comparability invariants, and marking measurement-critical files as off-limits

@@ -1,6 +1,9 @@
 # Changelog
 
 ## [Unreleased]
+### Added
+
+- Added native `libedit` bindings and `./libedit` exports for structured replace, patch, hashline, and hashline-formatting operations
 
 ## [13.12.0] - 2026-03-14
 ### Breaking Changes

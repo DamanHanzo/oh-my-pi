@@ -132,6 +132,14 @@
 			"types": "./src/keys/*.ts",
 			"import": "./src/keys/*.ts"
 		},
+		"./libedit": {
+			"types": "./src/libedit/index.ts",
+			"import": "./src/libedit/index.ts"
+		},
+		"./libedit/*": {
+			"types": "./src/libedit/*.ts",
+			"import": "./src/libedit/*.ts"
+		},
 		"./projfs": {
 			"types": "./src/projfs/index.ts",
 			"import": "./src/projfs/index.ts"

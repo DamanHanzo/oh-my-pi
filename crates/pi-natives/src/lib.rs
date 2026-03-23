@@ -34,6 +34,7 @@ pub mod html;
 pub mod image;
 pub mod keys;
 pub mod language;
+pub mod libedit;
 pub mod prof;
 pub mod projfs_overlay;
 pub mod ps;

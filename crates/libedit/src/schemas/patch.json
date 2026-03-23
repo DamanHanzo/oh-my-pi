@@ -1,0 +1,14 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["path"],
+  "properties": {
+    "path": { "type": "string" },
+    "op": {
+      "type": "string",
+      "enum": ["create", "delete", "update"]
+    },
+    "rename": { "type": "string" },
+    "diff": { "type": "string" }
+  }
+}

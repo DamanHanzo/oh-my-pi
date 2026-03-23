@@ -2,14 +2,9 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import {
-	ApplyPatchError,
-	applyPatch,
-	ParseError,
-	type PatchInput,
-	parseDiffHunks,
-	seekSequence,
-} from "@oh-my-pi/pi-coding-agent/patch";
+import { ApplyPatchError, applyPatch, ParseError, type PatchInput } from "@oh-my-pi/pi-coding-agent/patch";
+import { seekSequence } from "@oh-my-pi/pi-coding-agent/patch/fuzzy";
+import { parseHunks as parseDiffHunks } from "@oh-my-pi/pi-coding-agent/patch/parser";
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Legacy parser for test fixtures (*** Begin Patch format)
@@ -547,7 +542,9 @@ describe("applyPatch", () => {
 		const filePath = path.join(tempDir, "nodiff.txt");
 		await Bun.write(filePath, "content\n");
 
-		await expect(applyPatch({ path: "nodiff.txt", op: "update" }, { cwd: tempDir })).rejects.toThrow("requires diff");
+		await expect(applyPatch({ path: "nodiff.txt", op: "update" }, { cwd: tempDir })).rejects.toThrow(
+			"requires 'diff'",
+		);
 	});
 
 	test("creates parent directories for create", async () => {

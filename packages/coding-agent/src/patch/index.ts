@@ -12,6 +12,7 @@ import * as fs from "node:fs/promises";
 import * as nodePath from "node:path";
 import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallback } from "@oh-my-pi/pi-agent-core";
 import { StringEnum } from "@oh-my-pi/pi-ai";
+import { type LibEditOperation, type LibEditResult, libEditApply } from "@oh-my-pi/pi-natives/libedit";
 import { type Static, Type } from "@sinclair/typebox";
 import { renderPromptTemplate } from "../config/prompt-templates";
 import {
@@ -33,22 +34,11 @@ import {
 } from "../tools/fs-cache-invalidation";
 import { outputMeta } from "../tools/output-meta";
 import { enforcePlanModeWrite, resolvePlanPath } from "../tools/plan-mode-guard";
-import { applyPatch } from "./applicator";
-import { generateDiffString, generateUnifiedDiffString, replaceText } from "./diff";
 import { findMatch } from "./fuzzy";
-import {
-	type Anchor,
-	applyHashlineEdits,
-	buildCompactHashlineDiffPreview,
-	computeLineHash,
-	type HashlineEdit,
-	parseTag,
-} from "./hashline";
-import { detectLineEnding, normalizeToLF, restoreLineEndings, stripBom } from "./normalize";
+import { buildCompactHashlineDiffPreview } from "./hashline";
 import { type EditToolDetails, getLspBatchRequest } from "./shared";
 // Internal imports
-import type { FileSystem, Operation, PatchInput } from "./types";
-import { EditMatchError } from "./types";
+import { EditMatchError, type Operation } from "./types";
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Re-exports
@@ -59,14 +49,10 @@ export { applyPatch, defaultFileSystem, previewPatch } from "./applicator";
 // Diff generation
 export * from "./diff";
 
-// Fuzzy matching
-export * from "./fuzzy";
 // Hashline
 export * from "./hashline";
 // Normalization
 export * from "./normalize";
-// Parsing
-export { normalizeCreateContent, normalizeDiff, parseHunks as parseDiffHunks } from "./parser";
 export type { EditRenderContext, EditToolDetails } from "./shared";
 // Rendering
 export { editToolRenderer, getLspBatchRequest } from "./shared";
@@ -220,130 +206,6 @@ const hashlineEditParamsSchema = Type.Object(
 export type HashlineToolEdit = Static<typeof hashlineEditSchema>;
 export type HashlineParams = Static<typeof hashlineEditParamsSchema>;
 
-// ═══════════════════════════════════════════════════════════════════════════
-// Resilient anchor resolution
-// ═══════════════════════════════════════════════════════════════════════════
-
-/**
- * Map loc/content tool-schema edits into typed HashlineEdit objects.
- *
- * Each edit entry has a `loc` (where to edit) and `content` (what to insert/replace).
- * loc can be:
- *   - "append" / "prepend" — file-level insert
- *   - { append: anchor } / { prepend: anchor } — insert relative to anchor
- *   - { replace_line: anchor } — replace one line
- *   - { replace_block: { pos, end } } — replace inclusive range
- */
-function resolveEditAnchors(edits: HashlineToolEdit[]): HashlineEdit[] {
-	const result: HashlineEdit[] = [];
-	for (const edit of edits) {
-		const lines = hashlineParseText(edit.content);
-		const loc = edit.loc;
-
-		if (loc === "append") {
-			result.push({ op: "append_file", lines });
-		} else if (loc === "prepend") {
-			result.push({ op: "prepend_file", lines });
-		} else if (typeof loc === "object") {
-			if ("append" in loc) {
-				const anchor = tryParseTag(loc.append);
-				if (!anchor) throw new Error("append requires a valid anchor.");
-				result.push({ op: "append_at", pos: anchor, lines });
-			} else if ("prepend" in loc) {
-				const anchor = tryParseTag(loc.prepend);
-				if (!anchor) throw new Error("prepend requires a valid anchor.");
-				result.push({ op: "prepend_at", pos: anchor, lines });
-			} else if ("line" in loc) {
-				const anchor = tryParseTag(loc.line);
-				if (!anchor) throw new Error("line requires a valid anchor.");
-				result.push({ op: "replace_line", pos: anchor, lines });
-			} else if ("block" in loc) {
-				const posAnchor = tryParseTag(loc.block.pos);
-				const endAnchor = tryParseTag(loc.block.end);
-				if (!posAnchor || !endAnchor) throw new Error("block requires valid pos and end anchors.");
-				result.push({ op: "replace_range", pos: posAnchor, end: endAnchor, lines });
-			} else {
-				throw new Error("Unknown loc shape. Expected append, prepend, line, or block.");
-			}
-		} else {
-			throw new Error(`Invalid loc value: ${JSON.stringify(loc)}`);
-		}
-	}
-	return result;
-}
-
-/** Parse a tag, returning undefined instead of throwing on garbage. */
-function tryParseTag(raw: string): Anchor | undefined {
-	try {
-		return parseTag(raw);
-	} catch {
-		return undefined;
-	}
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-// LSP FileSystem for patch mode
-// ═══════════════════════════════════════════════════════════════════════════
-
-class LspFileSystem implements FileSystem {
-	#lastDiagnostics: FileDiagnosticsResult | undefined;
-	#fileCache: Record<string, Bun.BunFile> = {};
-
-	constructor(
-		private readonly writethrough: (
-			dst: string,
-			content: string,
-			signal?: AbortSignal,
-			file?: import("bun").BunFile,
-			batch?: { id: string; flush: boolean },
-		) => Promise<FileDiagnosticsResult | undefined>,
-		private readonly signal?: AbortSignal,
-		private readonly batchRequest?: { id: string; flush: boolean },
-	) {}
-
-	#getFile(path: string): Bun.BunFile {
-		if (this.#fileCache[path]) {
-			return this.#fileCache[path];
-		}
-		const file = Bun.file(path);
-		this.#fileCache[path] = file;
-		return file;
-	}
-
-	async exists(path: string): Promise<boolean> {
-		return this.#getFile(path).exists();
-	}
-
-	async read(path: string): Promise<string> {
-		return this.#getFile(path).text();
-	}
-
-	async readBinary(path: string): Promise<Uint8Array> {
-		const buffer = await this.#getFile(path).arrayBuffer();
-		return new Uint8Array(buffer);
-	}
-
-	async write(path: string, content: string): Promise<void> {
-		const file = this.#getFile(path);
-		const result = await this.writethrough(path, content, this.signal, file, this.batchRequest);
-		if (result) {
-			this.#lastDiagnostics = result;
-		}
-	}
-
-	async delete(path: string): Promise<void> {
-		await this.#getFile(path).unlink();
-	}
-
-	async mkdir(path: string): Promise<void> {
-		await fs.mkdir(path, { recursive: true });
-	}
-
-	getDiagnostics(): FileDiagnosticsResult | undefined {
-		return this.#lastDiagnostics;
-	}
-}
-
 function mergeDiagnosticsWithWarnings(
 	diagnostics: FileDiagnosticsResult | undefined,
 	warnings: string[],
@@ -385,6 +247,24 @@ function isHashlineParams(params: ReplaceParams | PatchParams | HashlineParams):
 
 function isReplaceParams(params: ReplaceParams | PatchParams | HashlineParams): params is ReplaceParams {
 	return "old_text" in params && "new_text" in params;
+}
+
+function normalizeReplaceResultMessage(message: string, path: string): string {
+	const occurrencesMatch = /^Replaced (\d+) occurrences? in /u.exec(message);
+	if (occurrencesMatch) {
+		return `Successfully replaced ${occurrencesMatch[1]} occurrences in ${path}`;
+	}
+	if (/^Replaced text in /u.test(message)) {
+		return `Successfully replaced text in ${path}`;
+	}
+	return message;
+}
+
+function normalizeReplaceErrorMessage(message: string, path: string): string {
+	if (message.startsWith("No match found in ")) {
+		return `Could not find a close enough match in ${path}.`;
+	}
+	return message;
 }
 
 /**
@@ -501,6 +381,81 @@ export class EditTool implements AgentTool<TInput> {
 		}
 	}
 
+	async #runLibEdit(
+		methodName: "hashline" | "patch" | "replace",
+		input: unknown,
+		files: Array<{ path: string; content: string }>,
+		displayPaths: Array<{ absolute: string; display: string }>,
+	): Promise<{ result: LibEditResult; operations: LibEditOperation[] }> {
+		try {
+			return await libEditApply(methodName, input, files, {
+				allowFuzzy: this.#allowFuzzy,
+				threshold: this.#fuzzyThreshold,
+			});
+		} catch (error) {
+			let message = error instanceof Error ? error.message : String(error);
+			for (const { absolute, display } of displayPaths) {
+				message = message.replaceAll(absolute, display);
+			}
+			throw new Error(message);
+		}
+	}
+
+	async #applyLibEditOperations(
+		operations: LibEditOperation[],
+		signal: AbortSignal | undefined,
+		batchRequest: { id: string; flush: boolean } | undefined,
+	): Promise<FileDiagnosticsResult | undefined> {
+		let diagnostics: FileDiagnosticsResult | undefined;
+		let deleted = false;
+		for (const operation of operations) {
+			if (operation.kind === "write") {
+				if (operation.content === undefined) {
+					throw new Error(`libedit write operation missing content for ${operation.path}`);
+				}
+				const result = await this.#writethrough(
+					operation.path,
+					operation.content,
+					signal,
+					Bun.file(operation.path),
+					batchRequest,
+				);
+				if (result) {
+					diagnostics = result;
+				}
+				continue;
+			}
+
+			deleted = true;
+			try {
+				await Bun.file(operation.path).unlink();
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+					throw error;
+				}
+			}
+		}
+
+		if (deleted && batchRequest?.flush && !diagnostics) {
+			const flushedDiagnostics = await flushLspWritethroughBatch(batchRequest.id, this.session.cwd, signal);
+			diagnostics ??= flushedDiagnostics;
+		}
+
+		return diagnostics;
+	}
+
+	#invalidateLibEditResult(result: LibEditResult): void {
+		for (const change of [result.change, ...result.changes]) {
+			if (change.new_path) {
+				invalidateFsScanAfterRename(change.path, change.new_path);
+			} else if (change.op === "delete") {
+				invalidateFsScanAfterDelete(change.path);
+			} else {
+				invalidateFsScanAfterWrite(change.path);
+			}
+		}
+	}
+
 	async execute(
 		_toolCallId: string,
 		params: ReplaceParams | PatchParams | HashlineParams,
@@ -510,9 +465,6 @@ export class EditTool implements AgentTool<TInput> {
 	): Promise<AgentToolResult<EditToolDetails, TInput>> {
 		const batchRequest = getLspBatchRequest(context?.toolCall);
 
-		// ─────────────────────────────────────────────────────────────────
-		// Hashline mode execution
-		// ─────────────────────────────────────────────────────────────────
 		if (this.mode === "hashline") {
 			if (!isHashlineParams(params)) {
 				throw new Error("Invalid edit parameters for hashline mode.");
@@ -569,129 +521,38 @@ export class EditTool implements AgentTool<TInput> {
 					},
 				};
 			}
-
-			if (!sourceExists) {
-				const lines: string[] = [];
-				for (const edit of edits) {
-					// For file creation, only anchorless appends/prepends are valid
-					if (edit.loc === "append") {
-						lines.push(...hashlineParseText(edit.content));
-					} else if (edit.loc === "prepend") {
-						lines.unshift(...hashlineParseText(edit.content));
-					} else {
-						throw new Error(`File not found: ${path}`);
-					}
-				}
-				await fs.writeFile(absolutePath, lines.join("\n"));
-				return {
-					content: [{ type: "text", text: `Created ${path}` }],
-					details: {
-						diff: "",
-						op: "create",
-						meta: outputMeta().get(),
-					},
-				};
+			const fileSeeds: Array<{ path: string; content: string }> = [];
+			if (sourceExists) {
+				const rawContent = await fs.readFile(absolutePath, "utf-8");
+				await checkAutoGeneratedFileContent(rawContent, path);
+				fileSeeds.push({ path: absolutePath, content: rawContent });
 			}
-
-			const anchorEdits = resolveEditAnchors(edits);
-
-			const rawContent = await fs.readFile(absolutePath, "utf-8");
-			await checkAutoGeneratedFileContent(rawContent, path);
-			const { bom, text } = stripBom(rawContent);
-			const originalEnding = detectLineEnding(text);
-			const originalNormalized = normalizeToLF(text);
-			let normalizedText = originalNormalized;
-
-			// Apply anchor-based edits first (replace, append_at, prepend_at)
-			const anchorResult = applyHashlineEdits(normalizedText, anchorEdits);
-			normalizedText = anchorResult.lines;
-
-			const result = {
-				text: normalizedText,
-				firstChangedLine: anchorResult.firstChangedLine,
-				warnings: anchorResult.warnings,
-				noopEdits: anchorResult.noopEdits,
-			};
-			if (originalNormalized === result.text && !move) {
-				let diagnostic = `No changes made to ${path}. The edits produced identical content.`;
-				if (result.noopEdits && result.noopEdits.length > 0) {
-					const details = result.noopEdits
-						.map(
-							e =>
-								`Edit ${e.editIndex}: replacement for ${e.loc} is identical to current content:\n  ${e.loc}| ${e.current}`,
-						)
-						.join("\n");
-					diagnostic += `\n${details}`;
-					diagnostic +=
-						"\nYour content must differ from what the file already contains. Re-read the file to see the current state.";
-				} else {
-					// Edits were not literally identical but heuristics normalized them back
-					const lines = result.text.split("\n");
-					const targetLines: string[] = [];
-					const refs: Anchor[] = [];
-					for (const edit of anchorEdits) {
-						refs.length = 0;
-						switch (edit.op) {
-							case "replace_line":
-								refs.push(edit.pos);
-								break;
-							case "replace_range":
-								refs.push(edit.end, edit.pos);
-								break;
-							case "append_at":
-							case "prepend_at":
-								refs.push(edit.pos);
-								break;
-							case "append_file":
-							case "prepend_file":
-								break;
-						}
-
-						for (const ref of refs) {
-							try {
-								if (ref.line >= 1 && ref.line <= lines.length) {
-									const text = lines[ref.line - 1];
-									const hash = computeLineHash(ref.line, text);
-									targetLines.push(`${ref.line}#${hash}:${text}`);
-								}
-							} catch {
-								/* skip malformed refs */
-							}
-						}
-					}
-					if (targetLines.length > 0) {
-						const preview = [...new Set(targetLines)].slice(0, 5).join("\n");
-						diagnostic += `\nThe file currently contains these lines:\n${preview}\nYour edits were normalized back to the original content (whitespace-only differences are preserved as-is). Ensure your replacement changes actual code, not just formatting.`;
-					}
-				}
-				throw new Error(diagnostic);
-			}
-
-			const finalContent = bom + restoreLineEndings(result.text, originalEnding);
-			const writePath = resolvedMove ?? absolutePath;
-			const diagnostics = await this.#writethrough(
-				writePath,
-				finalContent,
-				signal,
-				Bun.file(writePath),
-				batchRequest,
+			const { result, operations } = await this.#runLibEdit(
+				"hashline",
+				{
+					path: absolutePath,
+					edits,
+					...(resolvedMove ? { move: resolvedMove } : {}),
+				},
+				fileSeeds,
+				[
+					{ absolute: absolutePath, display: path },
+					...(resolvedMove && move ? [{ absolute: resolvedMove, display: move }] : []),
+				],
 			);
-			if (resolvedMove && resolvedMove !== absolutePath) {
-				await fs.unlink(absolutePath);
-				invalidateFsScanAfterRename(absolutePath, resolvedMove);
-			} else {
-				invalidateFsScanAfterWrite(absolutePath);
-			}
-			const diffResult = generateDiffString(originalNormalized, result.text);
+			const diagnostics = await this.#applyLibEditOperations(operations, signal, batchRequest);
+			this.#invalidateLibEditResult(result);
 
 			const meta = outputMeta()
 				.diagnostics(diagnostics?.summary ?? "", diagnostics?.messages ?? [])
 				.get();
 
-			const resultText = move ? `Moved ${path} to ${move}` : `Updated ${path}`;
-			const preview = buildCompactHashlineDiffPreview(diffResult.diff);
+			const resultText =
+				result.change.op === "create" ? `Created ${path}` : move ? `Moved ${path} to ${move}` : `Updated ${path}`;
+			const diffText = result.diff ?? "";
+			const preview = buildCompactHashlineDiffPreview(diffText);
 			const summaryLine = `Changes: +${preview.addedLines} -${preview.removedLines}${preview.preview ? "" : " (no textual diff preview)"}`;
-			const warningsBlock = result.warnings?.length ? `\n\nWarnings:\n${result.warnings.join("\n")}` : "";
+			const warningsBlock = result.warnings.length ? `\n\nWarnings:\n${result.warnings.join("\n")}` : "";
 			const previewBlock = preview.preview ? `\n\nDiff preview:\n${preview.preview}` : "";
 			return {
 				content: [
@@ -701,19 +562,16 @@ export class EditTool implements AgentTool<TInput> {
 					},
 				],
 				details: {
-					diff: diffResult.diff,
-					firstChangedLine: result.firstChangedLine ?? diffResult.firstChangedLine,
+					diff: diffText,
+					firstChangedLine: result.first_changed_line,
 					diagnostics,
-					op: "update",
+					op: result.change.op,
 					move,
 					meta,
 				},
 			};
 		}
 
-		// ─────────────────────────────────────────────────────────────────
-		// Patch mode execution
-		// ─────────────────────────────────────────────────────────────────
 		if (this.mode === "patch") {
 			if (isHashlineParams(params) || isReplaceParams(params)) {
 				throw new Error("Invalid edit parameters for patch mode.");
@@ -735,37 +593,25 @@ export class EditTool implements AgentTool<TInput> {
 			}
 
 			await checkAutoGeneratedFile(resolvedPath, path);
-
-			const input: PatchInput = { path: resolvedPath, op, rename: resolvedRename, diff };
-			const fs = new LspFileSystem(this.#writethrough, signal, batchRequest);
-			const result = await applyPatch(input, {
-				cwd: this.session.cwd,
-				fs,
-				fuzzyThreshold: this.#fuzzyThreshold,
-				allowFuzzy: this.#allowFuzzy,
-			});
-			if (resolvedRename) {
-				invalidateFsScanAfterRename(resolvedPath, resolvedRename);
-			} else if (result.change.type === "delete") {
-				invalidateFsScanAfterDelete(resolvedPath);
-			} else {
-				invalidateFsScanAfterWrite(resolvedPath);
+			const fileSeeds: Array<{ path: string; content: string }> = [];
+			if (await fs.exists(resolvedPath)) {
+				fileSeeds.push({ path: resolvedPath, content: await fs.readFile(resolvedPath, "utf-8") });
 			}
-			const effRename = result.change.newPath ? rename : undefined;
-
-			// Generate diff for display
-			let diffResult: { diff: string; firstChangedLine: number | undefined } = {
-				diff: "",
-				firstChangedLine: undefined,
-			};
-			if (result.change.type === "update" && result.change.oldContent && result.change.newContent) {
-				const normalizedOld = normalizeToLF(stripBom(result.change.oldContent).text);
-				const normalizedNew = normalizeToLF(stripBom(result.change.newContent).text);
-				diffResult = generateUnifiedDiffString(normalizedOld, normalizedNew);
-			}
+			const { result, operations } = await this.#runLibEdit(
+				"patch",
+				{ path: resolvedPath, op, rename: resolvedRename, diff },
+				fileSeeds,
+				[
+					{ absolute: resolvedPath, display: path },
+					...(resolvedRename && rename ? [{ absolute: resolvedRename, display: rename }] : []),
+				],
+			);
+			const diagnostics = await this.#applyLibEditOperations(operations, signal, batchRequest);
+			this.#invalidateLibEditResult(result);
+			const effRename = result.change.new_path ? rename : undefined;
 
 			let resultText: string;
-			switch (result.change.type) {
+			switch (result.change.op) {
 				case "create":
 					resultText = `Created ${path}`;
 					break;
@@ -777,13 +623,7 @@ export class EditTool implements AgentTool<TInput> {
 					break;
 			}
 
-			let diagnostics = fs.getDiagnostics();
-			if (op === "delete" && batchRequest?.flush) {
-				const flushedDiagnostics = await flushLspWritethroughBatch(batchRequest.id, this.session.cwd, signal);
-				diagnostics ??= flushedDiagnostics;
-			}
-			const patchWarnings = result.warnings ?? [];
-			const mergedDiagnostics = mergeDiagnosticsWithWarnings(diagnostics, patchWarnings);
+			const mergedDiagnostics = mergeDiagnosticsWithWarnings(diagnostics, result.warnings);
 
 			const meta = outputMeta()
 				.diagnostics(mergedDiagnostics?.summary ?? "", mergedDiagnostics?.messages ?? [])
@@ -792,10 +632,10 @@ export class EditTool implements AgentTool<TInput> {
 			return {
 				content: [{ type: "text", text: resultText }],
 				details: {
-					diff: diffResult.diff,
-					firstChangedLine: diffResult.firstChangedLine,
+					diff: result.diff ?? "",
+					firstChangedLine: result.first_changed_line,
 					diagnostics: mergedDiagnostics,
-					op,
+					op: result.change.op,
 					move: effRename,
 					meta,
 				},
@@ -827,62 +667,41 @@ export class EditTool implements AgentTool<TInput> {
 		}
 
 		const rawContent = await fs.readFile(absolutePath, "utf-8");
-		const { bom, text: content } = stripBom(rawContent);
-		const originalEnding = detectLineEnding(content);
-		const normalizedContent = normalizeToLF(content);
-		const normalizedOldText = normalizeToLF(old_text);
-		const normalizedNewText = normalizeToLF(new_text);
 
-		const result = replaceText(normalizedContent, normalizedOldText, normalizedNewText, {
-			fuzzy: this.#allowFuzzy,
-			all: all ?? false,
-			threshold: this.#fuzzyThreshold,
-		});
-
-		if (result.count === 0) {
-			// Get error details
-			const matchOutcome = findMatch(normalizedContent, normalizedOldText, {
+		if (all) {
+			const preflight = findMatch(rawContent, old_text, {
 				allowFuzzy: this.#allowFuzzy,
 				threshold: this.#fuzzyThreshold,
 			});
-
-			if (matchOutcome.occurrences && matchOutcome.occurrences > 1) {
-				const previews = matchOutcome.occurrencePreviews?.join("\n\n") ?? "";
-				const moreMsg = matchOutcome.occurrences > 5 ? ` (showing first 5 of ${matchOutcome.occurrences})` : "";
-				throw new Error(
-					`Found ${matchOutcome.occurrences} occurrences in ${path}${moreMsg}:\n\n${previews}\n\n` +
-						`Add more context lines to disambiguate.`,
-				);
+			if (!preflight.match && (preflight.fuzzyMatches ?? 0) > 1) {
+				throw new EditMatchError(path, old_text, preflight.closest, {
+					allowFuzzy: this.#allowFuzzy,
+					threshold: this.#fuzzyThreshold,
+					fuzzyMatches: preflight.fuzzyMatches,
+				});
 			}
-
-			throw new EditMatchError(path, normalizedOldText, matchOutcome.closest, {
-				allowFuzzy: this.#allowFuzzy,
-				threshold: this.#fuzzyThreshold,
-				fuzzyMatches: matchOutcome.fuzzyMatches,
-			});
 		}
 
-		if (normalizedContent === result.content) {
-			throw new Error(
-				`No changes made to ${path}. The replacement produced identical content. This might indicate an issue with special characters or the text not existing as expected.`,
+		let result: LibEditResult;
+		let operations: LibEditOperation[];
+		try {
+			const response = await this.#runLibEdit(
+				"replace",
+				{ path: absolutePath, old_text, new_text, all },
+				[{ path: absolutePath, content: rawContent }],
+				[{ absolute: absolutePath, display: path }],
 			);
+			result = response.result;
+			operations = response.operations;
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			throw new Error(normalizeReplaceErrorMessage(message, path));
 		}
+		const diagnostics = await this.#applyLibEditOperations(operations, signal, batchRequest);
+		this.#invalidateLibEditResult(result);
 
-		const finalContent = bom + restoreLineEndings(result.content, originalEnding);
-		const diagnostics = await this.#writethrough(
-			absolutePath,
-			finalContent,
-			signal,
-			Bun.file(absolutePath),
-			batchRequest,
-		);
-		invalidateFsScanAfterWrite(absolutePath);
-		const diffResult = generateDiffString(normalizedContent, result.content);
-
-		const resultText =
-			result.count > 1
-				? `Successfully replaced ${result.count} occurrences in ${path}.`
-				: `Successfully replaced text in ${path}.`;
+		const normalizedMessage = result.message.replaceAll(absolutePath, path);
+		const resultText = normalizeReplaceResultMessage(normalizedMessage, path);
 
 		const meta = outputMeta()
 			.diagnostics(diagnostics?.summary ?? "", diagnostics?.messages ?? [])
@@ -890,7 +709,12 @@ export class EditTool implements AgentTool<TInput> {
 
 		return {
 			content: [{ type: "text", text: resultText }],
-			details: { diff: diffResult.diff, firstChangedLine: diffResult.firstChangedLine, diagnostics, meta },
+			details: {
+				diff: result.diff ?? "",
+				firstChangedLine: result.first_changed_line,
+				diagnostics,
+				meta,
+			},
 		};
 	}
 }

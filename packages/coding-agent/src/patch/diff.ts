@@ -1,22 +1,11 @@
 /**
- * Diff generation and replace-mode utilities for the edit tool.
- *
- * Provides diff string generation and the replace-mode edit logic
- * used when not in patch mode.
+ * Diff helpers and libedit-backed preview computations.
  */
+
+import { libEditApply } from "@oh-my-pi/pi-natives/libedit";
 import * as Diff from "diff";
 import { resolveToCwd } from "../tools/path-utils";
-import { previewPatch } from "./applicator";
-import { DEFAULT_FUZZY_THRESHOLD, findMatch } from "./fuzzy";
-import type { HashlineEdit } from "./hashline";
-import { applyHashlineEdits } from "./hashline";
-import { adjustIndentation, normalizeToLF, stripBom } from "./normalize";
-import type { DiffError, DiffResult, PatchInput } from "./types";
-import { EditMatchError } from "./types";
-
-// ═══════════════════════════════════════════════════════════════════════════
-// Diff String Generation
-// ═══════════════════════════════════════════════════════════════════════════
+import type { DiffError, DiffResult, Operation, PatchInput } from "./types";
 
 function countContentLines(content: string): number {
 	const lines = content.split("\n");
@@ -32,8 +21,7 @@ function formatNumberedDiffLine(prefix: "+" | "-" | " ", lineNum: number, width:
 }
 
 /**
- * Generate a unified diff string with line numbers and context.
- * Returns both the diff string and the first changed line number (in the new file).
+ * Generate a compact line-numbered diff.
  */
 export function generateDiffString(oldContent: string, newContent: string, contextLines = 4): DiffResult {
 	const parts = Diff.diffLines(oldContent, newContent);
@@ -55,12 +43,10 @@ export function generateDiffString(oldContent: string, newContent: string, conte
 		}
 
 		if (part.added || part.removed) {
-			// Capture the first changed line (in the new file)
 			if (firstChangedLine === undefined) {
 				firstChangedLine = newLineNum;
 			}
 
-			// Show the change
 			for (const line of raw) {
 				if (part.added) {
 					output.push(formatNumberedDiffLine("+", newLineNum, lineNumWidth, line));
@@ -71,82 +57,56 @@ export function generateDiffString(oldContent: string, newContent: string, conte
 				}
 			}
 			lastWasChange = true;
-		} else {
-			// Context lines - only show a few before/after changes
-			const nextPartIsChange = i < parts.length - 1 && (parts[i + 1].added || parts[i + 1].removed);
+			continue;
+		}
 
-			if (lastWasChange || nextPartIsChange) {
-				let linesToShow = raw;
-				let skipStart = 0;
-				let skipEnd = 0;
+		const nextPartIsChange = i < parts.length - 1 && (parts[i + 1].added || parts[i + 1].removed);
 
-				if (!lastWasChange) {
-					// Show only last N lines as leading context
-					skipStart = Math.max(0, raw.length - contextLines);
-					linesToShow = raw.slice(skipStart);
-				}
+		if (lastWasChange || nextPartIsChange) {
+			let linesToShow = raw;
+			let skipStart = 0;
+			let skipEnd = 0;
 
-				if (!nextPartIsChange && linesToShow.length > contextLines) {
-					// Show only first N lines as trailing context
-					skipEnd = linesToShow.length - contextLines;
-					linesToShow = linesToShow.slice(0, contextLines);
-				}
-
-				// Add ellipsis if we skipped lines at start
-				if (skipStart > 0) {
-					output.push(formatNumberedDiffLine(" ", oldLineNum, lineNumWidth, "..."));
-					oldLineNum += skipStart;
-					newLineNum += skipStart;
-				}
-
-				for (const line of linesToShow) {
-					output.push(formatNumberedDiffLine(" ", oldLineNum, lineNumWidth, line));
-					oldLineNum++;
-					newLineNum++;
-				}
-
-				// Add ellipsis if we skipped lines at end
-				if (skipEnd > 0) {
-					output.push(formatNumberedDiffLine(" ", oldLineNum, lineNumWidth, "..."));
-					oldLineNum += skipEnd;
-					newLineNum += skipEnd;
-				}
-			} else {
-				// Skip these context lines entirely
-				oldLineNum += raw.length;
-				newLineNum += raw.length;
+			if (!lastWasChange) {
+				skipStart = Math.max(0, raw.length - contextLines);
+				linesToShow = raw.slice(skipStart);
 			}
 
-			lastWasChange = false;
+			if (!nextPartIsChange && linesToShow.length > contextLines) {
+				skipEnd = linesToShow.length - contextLines;
+				linesToShow = linesToShow.slice(0, contextLines);
+			}
+
+			if (skipStart > 0) {
+				output.push(formatNumberedDiffLine(" ", oldLineNum, lineNumWidth, "..."));
+				oldLineNum += skipStart;
+				newLineNum += skipStart;
+			}
+
+			for (const line of linesToShow) {
+				output.push(formatNumberedDiffLine(" ", oldLineNum, lineNumWidth, line));
+				oldLineNum++;
+				newLineNum++;
+			}
+
+			if (skipEnd > 0) {
+				output.push(formatNumberedDiffLine(" ", oldLineNum, lineNumWidth, "..."));
+				oldLineNum += skipEnd;
+				newLineNum += skipEnd;
+			}
+		} else {
+			oldLineNum += raw.length;
+			newLineNum += raw.length;
 		}
+
+		lastWasChange = false;
 	}
 
 	return { diff: output.join("\n"), firstChangedLine };
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// Replace Mode Logic
-// ═══════════════════════════════════════════════════════════════════════════
-
-export interface ReplaceOptions {
-	/** Allow fuzzy matching */
-	fuzzy: boolean;
-	/** Replace all occurrences */
-	all: boolean;
-	/** Similarity threshold for fuzzy matching */
-	threshold?: number;
-}
-
-export interface ReplaceResult {
-	/** The new content after replacements */
-	content: string;
-	/** Number of replacements made */
-	count: number;
-}
-
 /**
- * Generate a unified diff string without file headers.
- * Returns both the diff string and the first changed line number (in the new file).
+ * Generate a unified diff with hunk headers.
  */
 export function generateUnifiedDiffString(oldContent: string, newContent: string, contextLines = 3): DiffResult {
 	const patch = Diff.structuredPatch("", "", oldContent, newContent, "", "", { context: contextLines });
@@ -154,6 +114,7 @@ export function generateUnifiedDiffString(oldContent: string, newContent: string
 	let firstChangedLine: number | undefined;
 	const maxLineNum = Math.max(countContentLines(oldContent), countContentLines(newContent));
 	const lineNumWidth = String(maxLineNum).length;
+
 	for (const hunk of patch.hunks) {
 		output.push(`@@ -${hunk.oldStart},${hunk.oldLines} +${hunk.newStart},${hunk.newLines} @@`);
 		let oldLine = hunk.oldStart;
@@ -184,96 +145,72 @@ export function generateUnifiedDiffString(oldContent: string, newContent: string
 	return { diff: output.join("\n"), firstChangedLine };
 }
 
+export interface ReplaceOptions {
+	fuzzy: boolean;
+	all: boolean;
+	threshold?: number;
+}
+
+export interface ReplaceResult {
+	content: string;
+	count: number;
+}
+
 /**
- * Find and replace text in content using fuzzy matching.
+ * Lightweight synchronous replacement helper retained for compatibility.
  */
 export function replaceText(content: string, oldText: string, newText: string, options: ReplaceOptions): ReplaceResult {
 	if (oldText.length === 0) {
 		throw new Error("oldText must not be empty.");
 	}
-	const threshold = options.threshold ?? DEFAULT_FUZZY_THRESHOLD;
-	let normalizedContent = normalizeToLF(content);
-	const normalizedOldText = normalizeToLF(oldText);
-	const normalizedNewText = normalizeToLF(newText);
-	let count = 0;
+
+	const occurrences = content.split(oldText).length - 1;
+	if (!options.all && occurrences > 1) {
+		throw new Error(`Found ${occurrences} occurrences. Add more context lines to disambiguate.`);
+	}
+
+	if (occurrences === 0) {
+		return { content, count: 0 };
+	}
 
 	if (options.all) {
-		// Check for exact matches first
-		const exactCount = normalizedContent.split(normalizedOldText).length - 1;
-		if (exactCount > 0) {
-			return {
-				content: normalizedContent.split(normalizedOldText).join(normalizedNewText),
-				count: exactCount,
-			};
-		}
-
-		// No exact matches - try fuzzy matching iteratively
-		while (true) {
-			const matchOutcome = findMatch(normalizedContent, normalizedOldText, {
-				allowFuzzy: options.fuzzy,
-				threshold,
-			});
-
-			const shouldUseClosest =
-				options.fuzzy &&
-				matchOutcome.closest &&
-				matchOutcome.closest.confidence >= threshold &&
-				(matchOutcome.fuzzyMatches === undefined || matchOutcome.fuzzyMatches <= 1);
-			const match = matchOutcome.match || (shouldUseClosest ? matchOutcome.closest : undefined);
-			if (!match) {
-				break;
-			}
-
-			const adjustedNewText = adjustIndentation(normalizedOldText, match.actualText, normalizedNewText);
-			if (adjustedNewText === match.actualText) {
-				break;
-			}
-			normalizedContent =
-				normalizedContent.substring(0, match.startIndex) +
-				adjustedNewText +
-				normalizedContent.substring(match.startIndex + match.actualText.length);
-			count++;
-		}
-
-		return { content: normalizedContent, count };
+		return {
+			content: content.split(oldText).join(newText),
+			count: occurrences,
+		};
 	}
 
-	// Single replacement mode
-	const matchOutcome = findMatch(normalizedContent, normalizedOldText, {
-		allowFuzzy: options.fuzzy,
-		threshold,
-	});
-
-	if (matchOutcome.occurrences && matchOutcome.occurrences > 1) {
-		const previews = matchOutcome.occurrencePreviews?.join("\n\n") ?? "";
-		const moreMsg = matchOutcome.occurrences > 5 ? ` (showing first 5 of ${matchOutcome.occurrences})` : "";
-		throw new Error(
-			`Found ${matchOutcome.occurrences} occurrences${moreMsg}:\n\n${previews}\n\n` +
-				`Add more context lines to disambiguate.`,
-		);
-	}
-
-	if (!matchOutcome.match) {
-		return { content: normalizedContent, count: 0 };
-	}
-
-	const match = matchOutcome.match;
-	const adjustedNewText = adjustIndentation(normalizedOldText, match.actualText, normalizedNewText);
-	normalizedContent =
-		normalizedContent.substring(0, match.startIndex) +
-		adjustedNewText +
-		normalizedContent.substring(match.startIndex + match.actualText.length);
-
-	return { content: normalizedContent, count: 1 };
+	const idx = content.indexOf(oldText);
+	return {
+		content: content.slice(0, idx) + newText + content.slice(idx + oldText.length),
+		count: 1,
+	};
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// Preview/Diff Computation
-// ═══════════════════════════════════════════════════════════════════════════
+function normalizePatchOp(op: string | undefined): Operation {
+	if (op === "create" || op === "delete" || op === "update") {
+		return op;
+	}
+	return "update";
+}
+
+function mapLibEditError(
+	error: unknown,
+	displayPath: string,
+	absolutePath: string,
+	displayRename: string | undefined,
+	absoluteRename: string | undefined,
+): string {
+	let message = error instanceof Error ? error.message : String(error);
+	message = message.replaceAll(absolutePath, displayPath);
+	if (displayRename && absoluteRename) {
+		message = message.replaceAll(absoluteRename, displayRename);
+	}
+	return message;
+}
 
 /**
- * Compute the diff for an edit operation without applying it.
- * Used for preview rendering in the TUI before the tool executes.
+ * Compute preview diff for replace-mode edit calls.
  */
 export async function computeEditDiff(
 	path: string,
@@ -288,146 +225,108 @@ export async function computeEditDiff(
 		return { error: "oldText must not be empty." };
 	}
 	const absolutePath = resolveToCwd(path, cwd);
+	const file = Bun.file(absolutePath);
+	if (!(await file.exists())) {
+		return { error: `File not found: ${path}` };
+	}
 
 	try {
-		const file = Bun.file(absolutePath);
-		try {
-			if (!(await file.exists())) {
-				return { error: `File not found: ${path}` };
-			}
-		} catch {
-			return { error: `File not found: ${path}` };
-		}
-
-		let rawContent: string;
-		try {
-			rawContent = await file.text();
-		} catch (error) {
-			const message = error instanceof Error ? error.message : String(error);
-			return { error: message || `Unable to read ${path}` };
-		}
-
-		const { text: content } = stripBom(rawContent);
-		const normalizedContent = normalizeToLF(content);
-		const normalizedOldText = normalizeToLF(oldText);
-		const normalizedNewText = normalizeToLF(newText);
-
-		const result = replaceText(normalizedContent, normalizedOldText, normalizedNewText, {
-			fuzzy,
-			all,
-			threshold,
-		});
-
-		if (result.count === 0) {
-			// Get closest match for error message
-			const matchOutcome = findMatch(normalizedContent, normalizedOldText, {
-				allowFuzzy: fuzzy,
-				threshold: threshold ?? DEFAULT_FUZZY_THRESHOLD,
-			});
-
-			if (matchOutcome.occurrences && matchOutcome.occurrences > 1) {
-				const previews = matchOutcome.occurrencePreviews?.join("\n\n") ?? "";
-				const moreMsg = matchOutcome.occurrences > 5 ? ` (showing first 5 of ${matchOutcome.occurrences})` : "";
-				return {
-					error: `Found ${matchOutcome.occurrences} occurrences in ${path}${moreMsg}:\n\n${previews}\n\nAdd more context lines to disambiguate.`,
-				};
-			}
-
-			return {
-				error: EditMatchError.formatMessage(path, normalizedOldText, matchOutcome.closest, {
-					allowFuzzy: fuzzy,
-					threshold: threshold ?? DEFAULT_FUZZY_THRESHOLD,
-					fuzzyMatches: matchOutcome.fuzzyMatches,
-				}),
-			};
-		}
-
-		if (normalizedContent === result.content) {
-			return {
-				error: `No changes would be made to ${path}. The replacement produces identical content.`,
-			};
-		}
-
-		return generateDiffString(normalizedContent, result.content);
-	} catch (err) {
-		return { error: err instanceof Error ? err.message : String(err) };
+		const rawContent = await file.text();
+		const { result } = await libEditApply(
+			"replace",
+			{ path: absolutePath, old_text: oldText, new_text: newText, all },
+			[{ path: absolutePath, content: rawContent }],
+			{ allowFuzzy: fuzzy, threshold },
+		);
+		return {
+			diff: result.diff ?? "",
+			firstChangedLine: result.first_changed_line,
+		};
+	} catch (error) {
+		return { error: mapLibEditError(error, path, absolutePath, undefined, undefined) };
 	}
 }
 
 /**
- * Compute the diff for a patch operation without applying it.
- * Used for preview rendering in the TUI before patch-mode edits execute.
+ * Compute preview diff for patch-mode edit calls.
  */
 export async function computePatchDiff(
 	input: PatchInput,
 	cwd: string,
 	options?: { fuzzyThreshold?: number; allowFuzzy?: boolean },
 ): Promise<DiffResult | DiffError> {
+	const op = normalizePatchOp(input.op);
+	const absolutePath = resolveToCwd(input.path, cwd);
+	const absoluteRename = input.rename ? resolveToCwd(input.rename, cwd) : undefined;
+	const file = Bun.file(absolutePath);
+	const seeds: Array<{ path: string; content: string }> = [];
+	if (await file.exists()) {
+		seeds.push({ path: absolutePath, content: await file.text() });
+	}
+
 	try {
-		const result = await previewPatch(input, {
-			cwd,
-			fuzzyThreshold: options?.fuzzyThreshold,
-			allowFuzzy: options?.allowFuzzy,
-		});
-		const oldContent = result.change.oldContent ?? "";
-		const newContent = result.change.newContent ?? "";
-		const normalizedOld = normalizeToLF(stripBom(oldContent).text);
-		const normalizedNew = normalizeToLF(stripBom(newContent).text);
-		if (!normalizedOld && !normalizedNew) {
-			return { diff: "", firstChangedLine: undefined };
-		}
-		return generateUnifiedDiffString(normalizedOld, normalizedNew);
-	} catch (err) {
-		return { error: err instanceof Error ? err.message : String(err) };
+		const { result } = await libEditApply(
+			"patch",
+			{ path: absolutePath, op, rename: absoluteRename, diff: input.diff },
+			seeds,
+			{
+				allowFuzzy: options?.allowFuzzy,
+				threshold: options?.fuzzyThreshold,
+			},
+		);
+		return {
+			diff: result.diff ?? "",
+			firstChangedLine: result.first_changed_line,
+		};
+	} catch (error) {
+		return {
+			error: mapLibEditError(error, input.path, absolutePath, input.rename, absoluteRename),
+		};
 	}
 }
+
 /**
- * Compute the diff for a hashline operation without applying it.
- * Used for preview rendering in the TUI before hashline-mode edits execute.
+ * Compute preview diff for hashline-mode edit calls.
  */
 export async function computeHashlineDiff(
-	input: { path: string; edits: HashlineEdit[]; move?: string },
+	input: { path: string; edits: unknown[]; move?: string },
 	cwd: string,
 ): Promise<DiffResult | DiffError> {
-	const { path, edits, move } = input;
-	const absolutePath = resolveToCwd(path, cwd);
-	const movePath = move ? resolveToCwd(move, cwd) : undefined;
-	const isMoveOnly = Boolean(movePath) && movePath !== absolutePath && edits.length === 0;
+	const absolutePath = resolveToCwd(input.path, cwd);
+	const absoluteMove = input.move ? resolveToCwd(input.move, cwd) : undefined;
+	const file = Bun.file(absolutePath);
+	const seeds: Array<{ path: string; content: string }> = [];
+	if (await file.exists()) {
+		seeds.push({ path: absolutePath, content: await file.text() });
+	}
 
 	try {
-		const file = Bun.file(absolutePath);
-		try {
-			if (!(await file.exists())) {
-				return { error: `File not found: ${path}` };
-			}
-		} catch {
-			return { error: `File not found: ${path}` };
+		const { result } = await libEditApply(
+			"hashline",
+			{
+				path: absolutePath,
+				edits: input.edits,
+				...(absoluteMove ? { move: absoluteMove } : {}),
+			},
+			seeds,
+		);
+		return {
+			diff: result.diff ?? "",
+			firstChangedLine: result.first_changed_line,
+		};
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		if (
+			!absoluteMove &&
+			message.includes("No changes made to") &&
+			message.includes("edits produced identical content")
+		) {
+			return {
+				error: `No changes would be made to ${input.path}. The edits produce identical content.`,
+			};
 		}
-
-		if (movePath === absolutePath) {
-			return { error: "move path is the same as source path" };
-		}
-		if (isMoveOnly) {
-			return { diff: "", firstChangedLine: undefined };
-		}
-
-		let rawContent: string;
-		try {
-			rawContent = await file.text();
-		} catch (error) {
-			const message = error instanceof Error ? error.message : String(error);
-			return { error: message || `Unable to read ${path}` };
-		}
-
-		const { text: content } = stripBom(rawContent);
-		const normalizedContent = normalizeToLF(content);
-		const result = applyHashlineEdits(normalizedContent, edits);
-		if (normalizedContent === result.lines && !move) {
-			return { error: `No changes would be made to ${path}. The edits produce identical content.` };
-		}
-
-		return generateDiffString(normalizedContent, result.lines);
-	} catch (err) {
-		return { error: err instanceof Error ? err.message : String(err) };
+		return {
+			error: mapLibEditError(error, input.path, absolutePath, input.move, absoluteMove),
+		};
 	}
 }

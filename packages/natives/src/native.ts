@@ -20,6 +20,7 @@ import "./highlight/types";
 import "./html/types";
 import "./image/types";
 import "./keys/types";
+import "./libedit/types";
 import "./ps/types";
 import "./projfs/types";
 import "./pty/types";
@@ -273,6 +274,10 @@ function validateNative(bindings: NativeBindings, source: string): void {
 	checkFn("invalidateFsScanCache");
 	checkFn("astGrep");
 	checkFn("astEdit");
+	checkFn("libEditListMethods");
+	checkFn("libEditApply");
+	checkFn("libEditFormatHashLines");
+	checkFn("libEditComputeLineHash");
 	checkFn("detectMacOSAppearance");
 	checkFn("MacAppearanceObserver");
 	checkFn("projfsOverlayProbe");

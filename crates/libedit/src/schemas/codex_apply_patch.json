@@ -1,0 +1,21 @@
+{
+  "oneOf": [
+    {
+      "type": "string",
+      "description": "Preferred input. Pass the raw Codex apply_patch payload, including the *** Begin Patch / *** End Patch envelope, as a JSON string. Nominal grammar (Lark): start: begin_patch hunk+ end_patch; begin_patch: \"*** Begin Patch\" LF; end_patch: \"*** End Patch\" LF?; hunk: add_hunk | delete_hunk | update_hunk; add_hunk: \"*** Add File: \" filename LF add_line+; delete_hunk: \"*** Delete File: \" filename LF; update_hunk: \"*** Update File: \" filename LF change_move? change?; filename: /(.+)/; add_line: \"+\" /(.*)/ LF -> line; change_move: \"*** Move to: \" filename LF; change: (change_context | change_line)+ eof_line?; change_context: (\"@@\" | \"@@ \" /(.+)/) LF; change_line: (\"+\" | \"-\" | \" \") /(.*)/ LF; eof_line: \"*** End of File\" LF. Runtime notes: patch markers and file headers are trimmed, empty patch bodies parse but fail later with \"No files were modified.\", absolute paths are accepted, and a single update chunk supports at most one optional @@ header."
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "input"
+      ],
+      "properties": {
+        "input": {
+          "type": "string",
+          "description": "Legacy compatibility wrapper for the same raw patch string. Prefer passing the string value directly."
+        }
+      }
+    }
+  ]
+}
